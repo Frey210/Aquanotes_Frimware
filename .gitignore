@@ -1,0 +1,6 @@
+**/.pio/
+**/.platformio-home/
+**/.vscode/
+**/graphify-out/
+**/include/secrets.h
+*.code-workspace
