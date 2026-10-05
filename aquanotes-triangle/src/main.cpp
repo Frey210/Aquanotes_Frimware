@@ -20,7 +20,13 @@
 #include "ui_types.h"
 #include "aerasea_logo_128x64_inverted.h"
 #include "mqtt_ca.h"
+#include "ota_update.h"
 #include "secrets.h"
+
+#ifndef DEVICE_POWER_SOURCE_PANEL
+#define DEVICE_POWER_SOURCE_PANEL 0
+#endif
+static constexpr bool DEVICE_USES_BATTERY = DEVICE_POWER_SOURCE_PANEL == 0;
 
 // =======================
 //  KONFIG PERANGKAT & NET
@@ -98,7 +104,10 @@ static const bool DO_SENSOR_ENABLED  = true;
 const char* MQTT_HOST  = "mqtt.farlabs.my.id";
 const uint16_t MQTT_PORT = 443;
 const char* MQTT_PATH  = "/mqtt";
-const char* FW_VERSION = "v2.0.0-MQTT";
+#ifndef AQUANOTES_FW_VERSION
+#define AQUANOTES_FW_VERSION "2.1.5-panel-canary"
+#endif
+const char* FW_VERSION = AQUANOTES_FW_VERSION;
 const uint32_t PUBLISH_INTERVAL_MS = 10000; // 10 detik
 const uint32_t MQTT_TIMEOUT_MS = 4000;
 const uint32_t BACKLIGHT_TIMEOUT_MS = 15000; // mati setelah 15 detik tanpa interaksi
@@ -181,8 +190,16 @@ struct TaskSensorArgs {
 
 struct TaskMqttArgs {
   QueueHandle_t qTelemetry;
+  QueueHandle_t qOtaCommand;
+  QueueHandle_t qOtaStatus;
   EventGroupHandle_t flags;
   RuntimeStatus* status;
+};
+
+struct TaskOtaArgs {
+  QueueHandle_t qOtaCommand;
+  QueueHandle_t qOtaStatus;
+  EventGroupHandle_t flags;
 };
 
 // Helper RS485
@@ -198,6 +215,8 @@ QueueHandle_t qDisplay;    // Snapshot sensor -> UI (len=1, overwrite)
 QueueHandle_t qTelemetry;  // Snapshot sensor -> MQTT (len=1, overwrite)
 QueueHandle_t qCalib;      // Perintah kalibrasi -> TaskSensors
 QueueHandle_t qCalibResult;// Hasil kalibrasi -> TaskUI
+QueueHandle_t qOtaCommand; // Desired OTA dari MQTT -> TaskOTA
+QueueHandle_t qOtaStatus;  // Status OTA dari TaskOTA -> TaskMQTT
 SemaphoreHandle_t mRS485;  // Mutex RS485
 EventGroupHandle_t egFlags;
 
@@ -205,6 +224,7 @@ EventGroupHandle_t egFlags;
 #define EG_WIFI_OK   (1<<0)
 #define EG_PORTAL_ON (1<<1)
 #define EG_WIFI_BUSY (1<<2)
+#define EG_OTA_ACTIVE (1<<3)
 
 // Input event
 enum InputType: uint8_t { ENC_DELTA, BTN_PRESS };
@@ -229,11 +249,20 @@ struct CalibResult {
   bool ok;
 };
 
+struct OtaStatusMessage {
+  uint32_t assignmentId = 0;
+  int16_t progress = -1;
+  bool clearPending = false;
+  char targetVersion[64] = {0};
+  char state[24] = {0};
+  char errorCode[40] = {0};
+};
+
 // Register map (from vendor datasheets)
 static const uint16_t REG_EC_CAL_FLOAT  = 0x0050;
 static const uint16_t REG_PH_CAL_FIXED  = 0x0055;
-static const uint16_t REG_DO_ZERO       = 0x1001; // write 0
-static const uint16_t REG_DO_AIR        = 0x1003; // air/slope calibration
+static const uint16_t REG_DO_ZERO       = 0x001C; // write 1: zero oxygen calibration
+static const uint16_t REG_DO_AIR        = 0x001A; // write 1: air calibration
 
 // =======================
 //  GLOBAL STATUS
@@ -242,9 +271,13 @@ RuntimeStatus gStatus;
 volatile uint32_t gLastInteractionMs = 0;
 volatile bool gBacklightOn = true;
 WebSocketsClient gMqttSocket;
-MQTTPubSub::PubSubClient<512> gMqtt;
+MQTTPubSub::PubSubClient<1024> gMqtt;
 uint32_t gBootNonce = 0;
 uint32_t gMessageSequence = 0;
+uint32_t gOtaMessageSequence = 0;
+volatile float gBatteryPercent = 0.0f;
+volatile bool gBatteryValid = false;
+volatile bool gCalibrationActive = false;
 
 // Battery sensor (SEN-0052)
 #define BAT_ADC_PIN 1
@@ -303,6 +336,7 @@ TaskInputArgs   gInputArgs{};
 TaskUIArgs      gUIArgs{};
 TaskSensorArgs  gSensorArgs{};
 TaskMqttArgs    gMqttArgs{};
+TaskOtaArgs     gOtaArgs{};
 
 // Menu cursors
 int menuCursor=0, calCursor=0, ecCalCursor=0, doCalCursor=0, phCalCursor=0;
@@ -367,6 +401,66 @@ static String buildTelemetryPayload(const DisplayData& s) {
   return payload;
 }
 
+static void queueOtaStatus(uint32_t assignmentId, const char* targetVersion,
+                           const char* state, int16_t progress = -1,
+                           const char* errorCode = nullptr, bool clearPending = false) {
+  if (!qOtaStatus || assignmentId == 0) return;
+  OtaStatusMessage message{};
+  message.assignmentId = assignmentId;
+  message.progress = progress;
+  message.clearPending = clearPending;
+  strncpy(message.targetVersion, targetVersion ? targetVersion : "", sizeof(message.targetVersion) - 1);
+  strncpy(message.state, state ? state : "failed", sizeof(message.state) - 1);
+  if (errorCode) strncpy(message.errorCode, errorCode, sizeof(message.errorCode) - 1);
+  if (xQueueSend(qOtaStatus, &message, 0) != pdTRUE) {
+    Serial.println("[OTA] status queue penuh");
+  }
+}
+
+static String buildOtaStatusPayload(const OtaStatusMessage& status) {
+  char messageId[96];
+  snprintf(messageId, sizeof(messageId), "%s-ota-%08lX-%lu", DEVICE_UID,
+           static_cast<unsigned long>(gBootNonce),
+           static_cast<unsigned long>(gOtaMessageSequence));
+  String payload = "{";
+  payload.reserve(320);
+  payload += "\"schema\":1,";
+  payload += "\"message_id\":\"" + String(messageId) + "\",";
+  payload += "\"assignment_id\":" + String(status.assignmentId) + ",";
+  payload += "\"running_version\":\"" + String(FW_VERSION) + "\",";
+  payload += "\"target_version\":\"" + String(status.targetVersion) + "\",";
+  payload += "\"state\":\"" + String(status.state) + "\",";
+  payload += "\"progress\":" + (status.progress >= 0 ? String(status.progress) : String("null")) + ",";
+  payload += "\"error_code\":";
+  payload += status.errorCode[0] ? "\"" + String(status.errorCode) + "\"" : "null";
+  payload += "}";
+  return payload;
+}
+
+static bool subscribeOtaDesired() {
+  const String topic = String("devices/") + DEVICE_UID + "/ota/desired";
+  return gMqtt.subscribe(topic, 1, [](const char* payload, const size_t length) {
+    if (!payload || length == 0) return;  // retained command dibersihkan backend
+    OtaCommand command{};
+    char errorCode[40] = {0};
+    if (!otaParseCommand(payload, length, command, errorCode, sizeof(errorCode))) {
+      Serial.printf("[OTA] manifest ditolak: %s\n", errorCode);
+      return;
+    }
+    if (!command.rollback && otaCompareVersions(command.version, FW_VERSION) < 0) {
+      queueOtaStatus(command.assignmentId, command.version, "failed", -1, "VERSION_REJECTED");
+      return;
+    }
+    if (xQueueOverwrite(qOtaCommand, &command) != pdTRUE) {
+      queueOtaStatus(command.assignmentId, command.version, "failed", -1, "QUEUE_FAILED");
+      return;
+    }
+    queueOtaStatus(command.assignmentId, command.version, "assigned");
+    Serial.printf("[OTA] assignment %lu diterima untuk %s\n",
+                  static_cast<unsigned long>(command.assignmentId), command.version);
+  });
+}
+
 static bool connectMqtt(RuntimeStatus& status) {
   if (gMqtt.isConnected()) return true;
 
@@ -380,6 +474,13 @@ static bool connectMqtt(RuntimeStatus& status) {
     Serial.printf("[MQTT] connect gagal: err=%d rc=%d\n",
                   static_cast<int>(gMqtt.getLastError()),
                   static_cast<int>(gMqtt.getReturnCode()));
+    return false;
+  }
+
+  if (!subscribeOtaDesired()) {
+    setSendStatus(status, "ESUB");
+    Serial.println("[OTA] subscribe desired gagal");
+    gMqtt.disconnect();
     return false;
   }
 
@@ -695,10 +796,10 @@ static bool handleCalibration(CalibCmd cmd){
       ok = writeFloatRegisters(mb_ec, REG_EC_CAL_FLOAT, 12.88f);
       break;
     case CalibCmd::DO_ZERO:
-      ok = writeReg(mb_do, REG_DO_ZERO, 0);
+      ok = writeReg(mb_do, REG_DO_ZERO, 1);
       break;
     case CalibCmd::DO_AIR:
-      ok = writeReg(mb_do, REG_DO_AIR, 0);
+      ok = writeReg(mb_do, REG_DO_AIR, 1);
       break;
     case CalibCmd::PH_400:
       ok = writeReg(mb_ph, REG_PH_CAL_FIXED, 4);
@@ -839,7 +940,9 @@ static void formatDashboardStrings(const DisplayData& d, DashboardCache& out){
   if (d.wifiOK) snprintf(wifi, sizeof(wifi), "OK");
   else          snprintf(wifi, sizeof(wifi), "E%d", d.wifiStatus);
 
-  if (d.bat_ok){
+  if (!DEVICE_USES_BATTERY){
+    snprintf(out.status, sizeof(out.status), "W:%s S:%s B:DC", wifi, d.sendStatus);
+  } else if (d.bat_ok){
     char volts[8];
     snprintf(volts, sizeof(volts), "%.1f", d.bat_v);
     char* decimal = strchr(volts, '.');
@@ -1671,7 +1774,112 @@ void TaskUI(void* param){
       }
     }
 
+    gCalibrationActive = (ui == UIState::CAL_WIZARD);
     vTaskDelay(pdMS_TO_TICKS(wifiBusy ? 150 : 50));
+  }
+}
+
+static void otaProgress(uint8_t progress, void* context) {
+  const auto* command = static_cast<const OtaCommand*>(context);
+  char displayStatus[16];
+  snprintf(displayStatus, sizeof(displayStatus), "OTA%u", progress);
+  setSendStatus(gStatus, displayStatus);
+  if (command) queueOtaStatus(command->assignmentId, command->version, "downloading", progress);
+}
+
+// =======================
+// TaskOTA (Core 0)
+// =======================
+void TaskOTA(void* param) {
+  auto* args = static_cast<TaskOtaArgs*>(param);
+  if (!args || !args->qOtaCommand || !args->qOtaStatus || !args->flags) {
+    vTaskDelete(NULL);
+    return;
+  }
+
+  OtaPendingReport bootReport{};
+  if (otaLoadPendingReport(bootReport)) {
+    if (otaRunningImagePendingVerify()) {
+      queueOtaStatus(bootReport.assignmentId, bootReport.targetVersion, "pending_verify");
+      vTaskDelay(pdMS_TO_TICKS(30000));
+      if (otaMarkRunningImageValid()) {
+        queueOtaStatus(bootReport.assignmentId, bootReport.targetVersion, "success", 100, nullptr, true);
+      } else {
+        queueOtaStatus(bootReport.assignmentId, bootReport.targetVersion, "failed", -1, "SELF_TEST_FAILED");
+        vTaskDelay(pdMS_TO_TICKS(1000));
+        ESP.restart();
+      }
+    } else if (strcmp(FW_VERSION, bootReport.targetVersion) == 0) {
+      queueOtaStatus(bootReport.assignmentId, bootReport.targetVersion, "success", 100, nullptr, true);
+    } else {
+      queueOtaStatus(bootReport.assignmentId, bootReport.targetVersion, "rolled_back", -1, "ROLLED_BACK", true);
+    }
+  }
+
+  OtaCommand command{};
+  bool hasCommand = false;
+  uint8_t attempts = 0;
+  uint32_t nextAttemptAt = 0;
+  const uint32_t retryDelayMs[] = {60000, 300000, 1800000};
+
+  for (;;) {
+    OtaCommand incoming{};
+    if (xQueueReceive(args->qOtaCommand, &incoming, pdMS_TO_TICKS(1000)) == pdTRUE) {
+      command = incoming;
+      hasCommand = true;
+      attempts = 0;
+      nextAttemptAt = 0;
+    }
+    if (!hasCommand || (nextAttemptAt != 0 && static_cast<int32_t>(millis() - nextAttemptAt) < 0)) continue;
+
+    if (strcmp(command.version, FW_VERSION) == 0) {
+      queueOtaStatus(command.assignmentId, command.version, "success", 100, nullptr, true);
+      hasCommand = false;
+      continue;
+    }
+
+    const char* deferredReason = nullptr;
+    if (WiFi.status() != WL_CONNECTED) deferredReason = "WIFI_OFFLINE";
+    else if (WiFi.RSSI() < -75) deferredReason = "WEAK_WIFI";
+    else if (DEVICE_USES_BATTERY && (!gBatteryValid || gBatteryPercent < 50.0f)) deferredReason = "LOW_BATTERY";
+    else if (gCalibrationActive) deferredReason = "CALIBRATION_ACTIVE";
+
+    if (deferredReason) {
+      queueOtaStatus(command.assignmentId, command.version, "deferred", -1, deferredReason);
+      nextAttemptAt = millis() + 60000;
+      continue;
+    }
+
+    if (!otaSavePendingReport(command)) {
+      queueOtaStatus(command.assignmentId, command.version, "failed", -1, "NVS_FAILED");
+      hasCommand = false;
+      continue;
+    }
+
+    xEventGroupSetBits(args->flags, EG_OTA_ACTIVE);
+    queueOtaStatus(command.assignmentId, command.version, "downloading", 0);
+    char errorCode[40] = {0};
+    const bool ok = otaPerformUpdate(command, otaProgress, &command, errorCode, sizeof(errorCode));
+    xEventGroupClearBits(args->flags, EG_OTA_ACTIVE);
+
+    if (ok) {
+      setSendStatus(gStatus, "OTA OK");
+      queueOtaStatus(command.assignmentId, command.version, "downloaded", 100);
+      queueOtaStatus(command.assignmentId, command.version, "rebooting", 100);
+      vTaskDelay(pdMS_TO_TICKS(1500));
+      ESP.restart();
+    }
+
+    otaClearPendingReport();
+    setSendStatus(gStatus, "OTA ERR");
+    ++attempts;
+    if (attempts >= 3) {
+      queueOtaStatus(command.assignmentId, command.version, "failed", -1, errorCode);
+      hasCommand = false;
+    } else {
+      queueOtaStatus(command.assignmentId, command.version, "deferred", -1, errorCode);
+      nextAttemptAt = millis() + retryDelayMs[attempts - 1];
+    }
   }
 }
 
@@ -1715,9 +1923,11 @@ void TaskSensors(void* param){
     EventBits_t loopFlags = xEventGroupGetBits(args->flags);
     bool wifiBusy = (loopFlags & EG_WIFI_BUSY);
 
+    const bool otaActive = (loopFlags & EG_OTA_ACTIVE);
+
     // 1) Proses perintah kalibrasi dari wizard UI.
     CalibMsg msg;
-    while (xQueueReceive(args->qCalib, &msg, 0) == pdTRUE){
+    while (!otaActive && xQueueReceive(args->qCalib, &msg, 0) == pdTRUE){
       CalibResult result{msg.cmd, false};
       if (xSemaphoreTake(args->rs485, rsLockTimeout) == pdTRUE){
         result.ok = handleCalibration(msg.cmd);
@@ -1728,7 +1938,7 @@ void TaskSensors(void* param){
     }
 
     // 2) Poll sensor modular satu per satu agar bus ringan dan watchdog aman
-    if (xSemaphoreTake(args->rs485, rsLockTimeout) == pdTRUE){
+    if (!otaActive && xSemaphoreTake(args->rs485, rsLockTimeout) == pdTRUE){
       readOneModularSensor(cur, modularPhase);
       resolveWaterTemperature(cur);
       rs485Receive();
@@ -1737,7 +1947,9 @@ void TaskSensors(void* param){
 
     float vbat = 0.0f;
     float batPct = 0.0f;
-    cur.bat_ok = readBattery(vbat, batPct);
+    cur.bat_ok = DEVICE_USES_BATTERY && readBattery(vbat, batPct);
+    gBatteryValid = cur.bat_ok;
+    gBatteryPercent = cur.bat_ok ? batPct : 0.0f;
     if (cur.bat_ok){
       cur.bat_v = vbat;
       cur.bat_pct = batPct;
@@ -1766,7 +1978,8 @@ void TaskSensors(void* param){
 // =======================
 void TaskMQTT(void* param){
   auto* args = static_cast<TaskMqttArgs*>(param);
-  if (!args || !args->qTelemetry || !args->status || !args->flags){
+  if (!args || !args->qTelemetry || !args->qOtaCommand || !args->qOtaStatus ||
+      !args->status || !args->flags){
     vTaskDelete(NULL);
     return;
   }
@@ -1788,6 +2001,8 @@ void TaskMQTT(void* param){
   DisplayData snap{};
   bool wifiWasConnected = false;
   String pendingPayload;
+  OtaStatusMessage pendingOtaStatus{};
+  bool hasPendingOtaStatus = false;
 
   for(;;){
     EventBits_t f = xEventGroupGetBits(args->flags);
@@ -1858,8 +2073,20 @@ void TaskMQTT(void* param){
       setSendStatus(*args->status, "ECON");
     }
 
+    if (!hasPendingOtaStatus && xQueueReceive(args->qOtaStatus, &pendingOtaStatus, 0) == pdTRUE) {
+      hasPendingOtaStatus = true;
+    }
+    if (hasPendingOtaStatus && wifiNow && connectMqtt(*args->status)) {
+      const String topic = String("devices/") + DEVICE_UID + "/ota/status";
+      if (gMqtt.publish(topic, buildOtaStatusPayload(pendingOtaStatus), false, 1)) {
+        ++gOtaMessageSequence;
+        if (pendingOtaStatus.clearPending) otaClearPendingReport();
+        hasPendingOtaStatus = false;
+      }
+    }
+
     // ====== Kirim data ke broker ======
-    if (millis() - lastPublish >= PUBLISH_INTERVAL_MS){
+    if (!(flags & EG_OTA_ACTIVE) && millis() - lastPublish >= PUBLISH_INTERVAL_MS){
       lastPublish = millis();
       if (xQueueReceive(args->qTelemetry, &snap, 0)==pdTRUE){
 
@@ -1892,15 +2119,22 @@ void setup(){
   gLastInteractionMs = millis();
   setBacklight(true);
 
-  analogReadResolution(12);
-  analogSetPinAttenuation(BAT_ADC_PIN, ADC_11db);
-  Serial.println("[BOOT] ADC ready");
+  if (DEVICE_USES_BATTERY){
+    analogReadResolution(12);
+    analogRead(BAT_ADC_PIN); // Arduino core memetakan channel ADC saat pembacaan pertama.
+    analogSetPinAttenuation(BAT_ADC_PIN, ADC_11db);
+    Serial.println("[BOOT] ADC ready");
+  } else {
+    Serial.println("[BOOT] Power profile: panel DC");
+  }
 
   qInput     = xQueueCreate(16, sizeof(InputEvent));
   qDisplay   = xQueueCreate(1,  sizeof(DisplayData));
   qTelemetry = xQueueCreate(1,  sizeof(DisplayData));
   qCalib     = xQueueCreate(4,  sizeof(CalibMsg));
   qCalibResult = xQueueCreate(1, sizeof(CalibResult));
+  qOtaCommand = xQueueCreate(1, sizeof(OtaCommand));
+  qOtaStatus = xQueueCreate(12, sizeof(OtaStatusMessage));
   mRS485     = xSemaphoreCreateMutex();
   egFlags    = xEventGroupCreate();
   Serial.println("[BOOT] RTOS objects ready");
@@ -1921,13 +2155,20 @@ void setup(){
   gSensorArgs.status     = &gStatus;
 
   gMqttArgs.qTelemetry = qTelemetry;
+  gMqttArgs.qOtaCommand = qOtaCommand;
+  gMqttArgs.qOtaStatus = qOtaStatus;
   gMqttArgs.flags      = egFlags;
   gMqttArgs.status     = &gStatus;
+
+  gOtaArgs.qOtaCommand = qOtaCommand;
+  gOtaArgs.qOtaStatus = qOtaStatus;
+  gOtaArgs.flags = egFlags;
 
   xTaskCreatePinnedToCore(TaskInput,   "TaskInput",   4096,  &gInputArgs,   5, NULL, 1);
   xTaskCreatePinnedToCore(TaskUI,      "TaskUI",      10240, &gUIArgs,      4, NULL, 1);
   xTaskCreatePinnedToCore(TaskSensors, "TaskSensors", 8192,  &gSensorArgs,  1, NULL, 0);
   xTaskCreatePinnedToCore(TaskMQTT,    "TaskMQTT",    8192,  &gMqttArgs,    1, NULL, 0);
+  xTaskCreatePinnedToCore(TaskOTA,     "TaskOTA",     12288, &gOtaArgs,     2, NULL, 0);
   Serial.println("[BOOT] tasks started");
 }
 

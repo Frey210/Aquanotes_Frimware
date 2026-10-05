@@ -1,4 +1,6 @@
 **/.pio/
+aquanotes-triangle/release/
+/secrets/
 **/.platformio-home/
 **/.vscode/
 **/graphify-out/

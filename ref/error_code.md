@@ -6,7 +6,7 @@ Berlaku untuk firmware `v2.0.0-MQTT`. Status atas memakai format:
 W:<Wi-Fi> S:<pengiriman> B:<baterai>
 ```
 
-Kondisi normal: `W:OK S:OK B:80% 16,0V`.
+Kondisi normal portable: `W:OK S:OK B:80% 16,0V`. Kondisi normal panel: `W:OK S:OK B:DC`.
 
 ## Wi-Fi (`W:`)
 
@@ -39,11 +39,31 @@ Serial Monitor 115200 menampilkan `[MQTT] connect gagal: err=... rc=...` atau `[
 | Kode | Arti | Periksa |
 |---|---|---|
 | `B:<n>% <v>V` | ADC valid; estimasi baterai 4S. | Bandingkan voltase dengan multimeter. |
+| `B:DC` | Unit berprofil panel memakai power supply langsung; ADC baterai sengaja tidak dibaca. | Normal untuk unit panel. Jika unit sebenarnya portable, periksa `DEVICE_POWER_SOURCE_PANEL` pada `secrets.h`. |
 | `B:0% <v>V` | Tegangan pada/di bawah kurva 13,2 V. | Baterai, pembagi 100k/22k, ground, GPIO1. |
 | `B:100% <v>V` | Tegangan pada/di atas 16,8 V. | Pastikan tidak over-voltage. |
 | `B:EADC` | ADC di bawah 0,1 V/tidak valid. | GPIO1, resistor, solderan, ground, konektor. |
 
 Masalah baterai tidak menghentikan publish telemetry.
+
+## OTA firmware
+
+OTA tidak ditampilkan sebagai error sensor. Status lengkap terlihat di halaman admin firmware dan Serial Monitor.
+
+| Kode | Arti | Periksa |
+|---|---|---|
+| `LOW_BATTERY` | Unit portable: baterai tidak valid atau di bawah 50%. Profil panel tidak memakai gate ini. | Nyalakan dari sumber normal; cek `B:` dan rangkaian GPIO1. Jangan ubah portable menjadi panel hanya untuk melewati proteksi. |
+| `WEAK_WIFI` | RSSI di bawah -75 dBm. | Dekatkan AP/perbaiki antena lalu tunggu retry. |
+| `WIFI_OFFLINE` | Wi-Fi tidak terhubung. | Ikuti pemeriksaan `W:`. |
+| `CALIBRATION_ACTIVE` | Kalibrasi sensor sedang berjalan. | Selesaikan/keluar dari wizard kalibrasi. |
+| `HTTP_*` | Download artifact gagal. | Domain API, Cloudflare, token assignment, dan log backend. |
+| `HASH_MISMATCH` | SHA-256 artifact tidak cocok. | Retire release; jangan mencoba artifact yang sama lagi. |
+| `SIGNATURE_INVALID` | Signature ECDSA tidak valid. | Signing key/key ID dan pasangan `.bin`/`.sig`. |
+| `IMAGE_BEGIN_FAILED` / `IMAGE_WRITE_FAILED` / `IMAGE_END_FAILED` | Penulisan slot OTA gagal. | Flash/partisi, ukuran artifact, suplai daya; gunakan recovery USB bila berulang. |
+| `NVS_FAILED` | Status pending OTA gagal disimpan. | NVS/flash; recovery melalui USB. |
+| `VERSION_REJECTED` | Versi lebih lama dikirim tanpa flag rollback. | Pilih release lebih baru atau gunakan rollback resmi. |
+
+Urutan normal adalah `assigned`, `downloading`, `downloaded`, `rebooting`, `pending_verify`, lalu `success`. `deferred` berarti perangkat aman tetapi menunggu syarat terpenuhi; `rolled_back` berarti bootloader kembali ke firmware known-good.
 
 ## Nilai sensor `--`
 
