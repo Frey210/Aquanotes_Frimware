@@ -95,9 +95,9 @@ void printReady(Stream& serial) {
   const uint64_t mac = ESP.getEfuseMac();
   char macText[18];
   snprintf(macText, sizeof(macText), "%02X:%02X:%02X:%02X:%02X:%02X",
-           static_cast<unsigned>((mac >> 40) & 0xff), static_cast<unsigned>((mac >> 32) & 0xff),
-           static_cast<unsigned>((mac >> 24) & 0xff), static_cast<unsigned>((mac >> 16) & 0xff),
-           static_cast<unsigned>((mac >> 8) & 0xff), static_cast<unsigned>(mac & 0xff));
+           static_cast<unsigned>(mac & 0xff), static_cast<unsigned>((mac >> 8) & 0xff),
+           static_cast<unsigned>((mac >> 16) & 0xff), static_cast<unsigned>((mac >> 24) & 0xff),
+           static_cast<unsigned>((mac >> 32) & 0xff), static_cast<unsigned>((mac >> 40) & 0xff));
   challenge = esp_random();
   provisioningActive = true;
   serial.printf("AQPROV READY %s %08lX\n", macText, static_cast<unsigned long>(challenge));
@@ -112,7 +112,7 @@ void handleProvisioningJson(Stream& serial, const char* line) {
   }
 
   const uint32_t schema = document["schema"] | 0;
-  const uint32_t suppliedChallenge = document["nonce"] | 0;
+  const uint32_t suppliedChallenge = document["nonce"].as<uint32_t>();
   const char* uid = document["uid"] | "";
   const char* password = document["mqtt_password"] | "";
   const char* powerProfile = document["power_profile"] | "";
