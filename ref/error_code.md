@@ -1,6 +1,6 @@
 # Panduan kode LCD Aquanotes MQTT
 
-Berlaku untuk firmware `v2.0.0-MQTT`. Status atas memakai format:
+Berlaku untuk firmware MQTT `v2.0.0` sampai `v2.2.x`. Status atas memakai format:
 
 ```text
 W:<Wi-Fi> S:<pengiriman> B:<baterai>
@@ -29,6 +29,7 @@ Auto-reconnect dimulai 15 detik setelah boot lalu dicoba tiap 30 detik.
 |---|---|---|
 | `S:OK` | Broker menerima publish QoS 1 dan mengirim PUBACK. | Normal. Backend seharusnya menerima data. |
 | `S:--` | Belum mencoba atau Wi-Fi belum terhubung. | `W:`, lalu tunggu interval 10 detik. |
+| `S:ECFG` | UID/credential MQTT belum diprovision ke NVS. | Hubungkan USB dan jalankan Aquanotes Firmware Uploader; jangan membuat UID baru bila device sudah terdaftar. |
 | `S:ECON` | WSS/TLS/MQTT connect atau autentikasi gagal. | Internet/DNS, port 443, route Cloudflare `/mqtt`, broker, UID/password, CA, lalu Serial Monitor. |
 | `S:EPUB` | Terhubung tetapi publish/PUBACK gagal. | ACL topic `devices/<UID>/telemetry`, koneksi, broker/backend, lalu Serial Monitor. |
 
@@ -39,7 +40,7 @@ Serial Monitor 115200 menampilkan `[MQTT] connect gagal: err=... rc=...` atau `[
 | Kode | Arti | Periksa |
 |---|---|---|
 | `B:<n>% <v>V` | ADC valid; estimasi baterai 4S. | Bandingkan voltase dengan multimeter. |
-| `B:DC` | Unit berprofil panel memakai power supply langsung; ADC baterai sengaja tidak dibaca. | Normal untuk unit panel. Jika unit sebenarnya portable, periksa `DEVICE_POWER_SOURCE_PANEL` pada `secrets.h`. |
+| `B:DC` | Unit berprofil panel memakai power supply langsung; ADC baterai sengaja tidak dibaca. | Normal untuk unit panel. Jika unit sebenarnya portable, provision ulang dengan profil `portable`. |
 | `B:0% <v>V` | Tegangan pada/di bawah kurva 13,2 V. | Baterai, pembagi 100k/22k, ground, GPIO1. |
 | `B:100% <v>V` | Tegangan pada/di atas 16,8 V. | Pastikan tidak over-voltage. |
 | `B:EADC` | ADC di bawah 0,1 V/tidak valid. | GPIO1, resistor, solderan, ground, konektor. |

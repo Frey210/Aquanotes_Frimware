@@ -21,12 +21,7 @@
 #include "aerasea_logo_128x64_inverted.h"
 #include "mqtt_ca.h"
 #include "ota_update.h"
-#include "secrets.h"
-
-#ifndef DEVICE_POWER_SOURCE_PANEL
-#define DEVICE_POWER_SOURCE_PANEL 0
-#endif
-static constexpr bool DEVICE_USES_BATTERY = DEVICE_POWER_SOURCE_PANEL == 0;
+#include "device_config.h"
 
 // =======================
 //  KONFIG PERANGKAT & NET
@@ -105,7 +100,7 @@ const char* MQTT_HOST  = "mqtt.farlabs.my.id";
 const uint16_t MQTT_PORT = 443;
 const char* MQTT_PATH  = "/mqtt";
 #ifndef AQUANOTES_FW_VERSION
-#define AQUANOTES_FW_VERSION "2.1.5-panel-canary"
+#define AQUANOTES_FW_VERSION "2.2.0"
 #endif
 const char* FW_VERSION = AQUANOTES_FW_VERSION;
 const uint32_t PUBLISH_INTERVAL_MS = 10000; // 10 detik
@@ -381,7 +376,7 @@ static void seedClockFromBuild() {
 
 static String buildTelemetryPayload(const DisplayData& s) {
   char messageId[96];
-  snprintf(messageId, sizeof(messageId), "%s-%08lX-%lu", DEVICE_UID,
+  snprintf(messageId, sizeof(messageId), "%s-%08lX-%lu", deviceUid(),
            static_cast<unsigned long>(gBootNonce),
            static_cast<unsigned long>(gMessageSequence));
 
@@ -390,7 +385,7 @@ static String buildTelemetryPayload(const DisplayData& s) {
   String payload = "{";
   payload.reserve(320);
   payload += "\"message_id\":\"" + String(messageId)     + "\",";
-  payload += "\"uid\":\""      + String(DEVICE_UID)    + "\",";
+  payload += "\"uid\":\""      + String(deviceUid())    + "\",";
   payload += "\"suhu\":"       + jsonNumber(s.t_ds, 2) + ",";
   payload += "\"ph\":"         + jsonNumber(s.ph_ok ? s.ph : NAN, 2) + ",";
   payload += "\"do\":"         + jsonNumber(s.do_ok ? s.do_mgL : NAN, 2) + ",";
@@ -419,7 +414,7 @@ static void queueOtaStatus(uint32_t assignmentId, const char* targetVersion,
 
 static String buildOtaStatusPayload(const OtaStatusMessage& status) {
   char messageId[96];
-  snprintf(messageId, sizeof(messageId), "%s-ota-%08lX-%lu", DEVICE_UID,
+  snprintf(messageId, sizeof(messageId), "%s-ota-%08lX-%lu", deviceUid(),
            static_cast<unsigned long>(gBootNonce),
            static_cast<unsigned long>(gOtaMessageSequence));
   String payload = "{";
@@ -438,7 +433,7 @@ static String buildOtaStatusPayload(const OtaStatusMessage& status) {
 }
 
 static bool subscribeOtaDesired() {
-  const String topic = String("devices/") + DEVICE_UID + "/ota/desired";
+  const String topic = String("devices/") + deviceUid() + "/ota/desired";
   return gMqtt.subscribe(topic, 1, [](const char* payload, const size_t length) {
     if (!payload || length == 0) return;  // retained command dibersihkan backend
     OtaCommand command{};
@@ -463,13 +458,17 @@ static bool subscribeOtaDesired() {
 
 static bool connectMqtt(RuntimeStatus& status) {
   if (gMqtt.isConnected()) return true;
+  if (!deviceIsProvisioned()) {
+    setSendStatus(status, "ECFG");
+    return false;
+  }
 
   gMqttSocket.disconnect();
   gMqttSocket.beginSslWithCA(MQTT_HOST, MQTT_PORT, MQTT_PATH, MQTT_ROOT_CA, "mqtt");
   gMqttSocket.setReconnectInterval(5000);
   gMqttSocket.enableHeartbeat(15000, 3000, 2);
 
-  if (!gMqtt.connect(DEVICE_UID, DEVICE_UID, MQTT_PASSWORD)) {
+  if (!gMqtt.connect(deviceUid(), deviceUid(), deviceMqttPassword())) {
     setSendStatus(status, "ECON");
     Serial.printf("[MQTT] connect gagal: err=%d rc=%d\n",
                   static_cast<int>(gMqtt.getLastError()),
@@ -497,7 +496,7 @@ static bool publishData(const DisplayData& s, RuntimeStatus& status, String& pen
   if (!connectMqtt(status)) return false;
   if (pendingPayload.isEmpty()) pendingPayload = buildTelemetryPayload(s);
 
-  const String topic = String("devices/") + DEVICE_UID + "/telemetry";
+  const String topic = String("devices/") + deviceUid() + "/telemetry";
   if (gMqtt.publish(topic, pendingPayload, false, 1)) {
     setSendStatus(status, "OK");
     pendingPayload.clear();
@@ -940,7 +939,7 @@ static void formatDashboardStrings(const DisplayData& d, DashboardCache& out){
   if (d.wifiOK) snprintf(wifi, sizeof(wifi), "OK");
   else          snprintf(wifi, sizeof(wifi), "E%d", d.wifiStatus);
 
-  if (!DEVICE_USES_BATTERY){
+  if (!deviceUsesBattery()){
     snprintf(out.status, sizeof(out.status), "W:%s S:%s B:DC", wifi, d.sendStatus);
   } else if (d.bat_ok){
     char volts[8];
@@ -1032,7 +1031,7 @@ static void drawSplashStatic(){
 
   tft.setTextFont(2);
   tft.setTextColor(TFT_WHITE, splashBg);
-  char ln1[28]; snprintf(ln1, sizeof(ln1), "UID: %s", DEVICE_UID);
+  char ln1[28]; snprintf(ln1, sizeof(ln1), "UID: %s", deviceUid());
   char ln2[20]; snprintf(ln2, sizeof(ln2), "FW : %s", FW_VERSION);
   tft.drawCentreString(ln1, 160, 115, 2);
   tft.drawCentreString(ln2, 160, 135, 2);
@@ -1841,7 +1840,7 @@ void TaskOTA(void* param) {
     const char* deferredReason = nullptr;
     if (WiFi.status() != WL_CONNECTED) deferredReason = "WIFI_OFFLINE";
     else if (WiFi.RSSI() < -75) deferredReason = "WEAK_WIFI";
-    else if (DEVICE_USES_BATTERY && (!gBatteryValid || gBatteryPercent < 50.0f)) deferredReason = "LOW_BATTERY";
+    else if (deviceUsesBattery() && (!gBatteryValid || gBatteryPercent < 50.0f)) deferredReason = "LOW_BATTERY";
     else if (gCalibrationActive) deferredReason = "CALIBRATION_ACTIVE";
 
     if (deferredReason) {
@@ -1947,7 +1946,7 @@ void TaskSensors(void* param){
 
     float vbat = 0.0f;
     float batPct = 0.0f;
-    cur.bat_ok = DEVICE_USES_BATTERY && readBattery(vbat, batPct);
+    cur.bat_ok = deviceUsesBattery() && readBattery(vbat, batPct);
     gBatteryValid = cur.bat_ok;
     gBatteryPercent = cur.bat_ok ? batPct : 0.0f;
     if (cur.bat_ok){
@@ -2077,7 +2076,7 @@ void TaskMQTT(void* param){
       hasPendingOtaStatus = true;
     }
     if (hasPendingOtaStatus && wifiNow && connectMqtt(*args->status)) {
-      const String topic = String("devices/") + DEVICE_UID + "/ota/status";
+      const String topic = String("devices/") + deviceUid() + "/ota/status";
       if (gMqtt.publish(topic, buildOtaStatusPayload(pendingOtaStatus), false, 1)) {
         ++gOtaMessageSequence;
         if (pendingOtaStatus.clearPending) otaClearPendingReport();
@@ -2110,6 +2109,9 @@ void setup(){
   Serial.begin(115200);
   delay(100);
   Serial.println("[BOOT] setup begin");
+  const bool configured = deviceConfigBegin();
+  Serial.printf("[CONFIG] %s (%s)\n", configured ? deviceUid() : "UNPROVISIONED",
+                deviceUsesBattery() ? "portable" : "panel");
 
   ledInit();
   Serial.println("[BOOT] LED ready");
@@ -2119,7 +2121,7 @@ void setup(){
   gLastInteractionMs = millis();
   setBacklight(true);
 
-  if (DEVICE_USES_BATTERY){
+  if (deviceUsesBattery()){
     analogReadResolution(12);
     analogRead(BAT_ADC_PIN); // Arduino core memetakan channel ADC saat pembacaan pertama.
     analogSetPinAttenuation(BAT_ADC_PIN, ADC_11db);
@@ -2173,5 +2175,6 @@ void setup(){
 }
 
 void loop(){
-  vTaskDelay(pdMS_TO_TICKS(1000));
+  deviceProvisioningPoll(Serial);
+  vTaskDelay(pdMS_TO_TICKS(20));
 }

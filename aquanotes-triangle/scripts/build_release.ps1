@@ -2,7 +2,8 @@ param(
     [Parameter(Mandatory = $true)]
     [ValidatePattern('^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$')]
     [string]$Version,
-    [string]$SigningKey
+    [string]$SigningKey,
+    [switch]$Generic
 )
 
 $ErrorActionPreference = 'Stop'
@@ -16,10 +17,11 @@ if ($configuration -notmatch "AQUANOTES_FW_VERSION=\\`"$escapedVersion\\`"") {
 Push-Location $projectRoot
 try {
     $env:PYTHONIOENCODING = 'utf-8'
-    & pio run
+    $environment = if ($Generic) { 'esp32-s3-generic' } else { 'esp32-s3-devkitc-1' }
+    & pio run -e $environment
     if ($LASTEXITCODE -ne 0) { throw 'PlatformIO build gagal.' }
 
-    $buildDir = Join-Path $projectRoot '.pio\build\esp32-s3-devkitc-1'
+    $buildDir = Join-Path $projectRoot ".pio\build\$environment"
     $firmware = Join-Path $buildDir 'firmware.bin'
     $factory = Join-Path $buildDir 'firmware.factory.bin'
     $partition = Join-Path $projectRoot 'partitions.csv'
@@ -41,13 +43,24 @@ try {
     Copy-Item -LiteralPath $partition -Destination (Join-Path $releaseDir 'partitions.csv') -Force
 
     $sha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $appOutput).Hash.ToLowerInvariant()
+    $factorySha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $factoryOutput).Hash.ToLowerInvariant()
+    $partitionSha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $partition).Hash.ToLowerInvariant()
     $manifest = [ordered]@{
-        schema = 1
+        schema = 2
         version = $Version
+        target = 'esp32-s3'
+        generic = [bool]$Generic
+        factory_only = [bool]$Generic
         artifact = [IO.Path]::GetFileName($appOutput)
         sha256 = $sha256
         size = $firmwareSize
+        factory_artifact = [IO.Path]::GetFileName($factoryOutput)
+        factory_sha256 = $factorySha256
+        factory_size = (Get-Item -LiteralPath $factoryOutput).Length
+        partitions_sha256 = $partitionSha256
+        flash_size = 0x800000
         slot_size = $slotSize
+        minimum_uploader_version = '1.0.0'
         build_utc = [DateTime]::UtcNow.ToString('o')
         git_commit = (& git rev-parse HEAD).Trim()
         signed = $false
@@ -64,6 +77,14 @@ try {
         $manifest.signature = [IO.Path]::GetFileName($signature)
         $manifest.signing_key_id = $signatureInfo.signing_key_id
         $manifest.signature_base64 = $signatureInfo.signature_base64
+
+        $factorySignature = "$factoryOutput.sig"
+        $factorySignatureMetadata = Join-Path $releaseDir 'factory-signature.json'
+        & python (Join-Path $PSScriptRoot 'sign_release.py') --key $resolvedKey --artifact $factoryOutput --signature $factorySignature --metadata $factorySignatureMetadata
+        if ($LASTEXITCODE -ne 0) { throw 'Penandatanganan factory image gagal.' }
+        $factorySignatureInfo = Get-Content -Raw $factorySignatureMetadata | ConvertFrom-Json
+        $manifest.factory_signature = [IO.Path]::GetFileName($factorySignature)
+        $manifest.factory_signature_base64 = $factorySignatureInfo.signature_base64
     }
 
     $manifest | ConvertTo-Json | Set-Content -Encoding utf8 (Join-Path $releaseDir 'manifest.json')
